@@ -1,5 +1,5 @@
-# Paths are relative to this file, which sits at the git repo root
-# (text_pipeline/, not the parent tokenizer/ directory).
+# Paths are relative to this file, at the repo root. Patterns are unanchored,
+# so __pycache__/ and .venv/ match at any depth (including text_pipeline/).
 
 # Python bytecode
 __pycache__/
