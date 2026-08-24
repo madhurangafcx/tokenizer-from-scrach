@@ -17,13 +17,14 @@ explaining *why* it works the way it does — the code is meant to be read.
 | Vocabulary + persistence | `vocabulary.py` | working |
 | Decoding | `decoder.py` | working |
 | Facade / orchestration | `tokenizer.py` | working |
-| **Merge training** | `bpe_trainer.py` | **stub — next to build** |
-| **Merge application** | `bpe_encoder.py` | **stub** |
+| Merge training | `bpe_trainer.py` | working |
+| Merge application | `bpe_encoder.py` | working |
 
-Until the trainer exists, the tokenizer runs at the byte level: every UTF-8 byte is
-one token, and the vocabulary is exactly 256 entries. That is a complete, working
-tokenizer — just an inefficient one. BPE is the optimization that earns the bytes
-back.
+Every stage is implemented. Constructed with no merges, the tokenizer runs at the
+byte level — every UTF-8 byte is one token, vocabulary exactly 256. Train a
+vocabulary and the same pipeline compresses about **2.4× on text resembling its
+training corpus**, while unseen text degrades gracefully back toward bytes instead
+of failing.
 
 ## Quick start
 
@@ -57,6 +58,53 @@ print(t.decode(r.token_ids))
 
 Note `é` costing two tokens — `195, 169` are its two UTF-8 bytes. That is the cost
 BPE exists to remove.
+
+## Training a vocabulary
+
+```python
+from app.bpe_trainer import train
+from app.tokenizer import Tokenizer
+
+corpus = [line for line in open("corpus.txt")]   # any iterable of strings
+result = train(corpus, vocab_size=8000)
+
+tokenizer = Tokenizer(vocabulary=result.vocabulary, merges=result.merges)
+tokenizer.save("artifacts/")                     # vocab.json + merges.txt
+```
+
+`train` returns a `TrainResult` holding a `Vocabulary` and an **ordered** merge list.
+Reload later with `Tokenizer.load("artifacts/")`.
+
+What the first merges look like on a small English corpus:
+
+```text
+rank  0    'h' + 'e'    -> 'he'
+rank  1    't' + 'he'   -> 'the'
+rank  2  'the' + 'r'    -> 'ther'
+rank  3 'ther' + 'e'    -> 'there'
+rank  4    'w' + 'a'    -> 'wa'
+rank  5   'wa' + 's'    -> 'was'
+```
+
+Each merge is built from earlier ones — `he` → `the` → `ther` → `there`. That
+staircase is how you tell training is working. Which pair wins first depends
+entirely on the corpus: here `('h','e')` beat `('t','h')` because `he` occurs more.
+
+Vocabulary size is a budget, not a promise:
+
+```text
+vocab_size=264   8 merges   'the theory of the weather there' -> 17 tokens
+vocab_size=300  44 merges                                     -> 11 tokens
+vocab_size=400  62 merges                                     -> 11 tokens
+```
+
+At 400 it stopped at 62 merges — the corpus ran out of pairs occurring more than
+once. Training halts there rather than merging noise, so `len(merges)` can be
+smaller than `vocab_size - 256`. On a real corpus you would not hit this.
+
+`normalization_form` and `pretokenizer` **must match** whatever the `Tokenizer`
+later uses. A mismatch raises no error; the encoder simply produces pieces the
+trainer never saw, the merges stop applying, and token counts quietly balloon.
 
 ## The pipeline
 
@@ -198,4 +246,9 @@ applying, and token counts that balloon.
 - The default pre-tokenizer splits whitespace into its own piece, so **no merge can
   ever span a space** — unlike GPT-2, which glues a leading space onto the following
   word. `GPT2_PATTERN` is provided for comparison.
+- `merge_pair` lives in `bpe_encoder.py` and is imported by `bpe_trainer.py`. Both
+  must apply merges identically, so the loop exists once rather than twice.
+- Training is O(rounds × distinct pieces) — every round recounts all pairs. Fine to
+  a few thousand merges; the standard fix is incremental pair counts that only
+  update the words containing the merged pair.
 - No test suite yet; `pytest` is not in `.venv`.

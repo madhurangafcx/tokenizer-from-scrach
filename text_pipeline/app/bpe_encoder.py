@@ -1,5 +1,4 @@
-"""BPE encoding: applying learned merges to one piece. NOT YET IMPLEMENTED.
-
+"""
 TRAINING VS ENCODING -- THE ASYMMETRY
 -------------------------------------
 Training and encoding both "do BPE", but they answer different questions:
@@ -32,9 +31,36 @@ never the leftmost.
 """
 
 from collections.abc import Iterable
-
 from .vocabulary import Vocabulary
 
+def merge_pair(symbols: list[str], pair: tuple[str,str]) -> list[str]:
+    """Replace every occurrence of `pair` in `symbols` with the joined symbol.
+
+    Module-level and shared: bpe_trainer imports this to rewrite its word
+    tuples after choosing a merge. Both sides must apply merges identically,
+    and this loop is the fiddly part -- duplicating it would let a fix in one
+    place silently miss the other.
+
+    Scanning left to right is not a style choice. On overlaps it decides the
+    answer: merging ('a','a') in "aaa" gives ['aa', 'a'], never ['a', 'aa'].
+    """
+    left,right, = pair
+    merged = left + right
+
+
+    out, index, count = [], 0, len(symbols)
+    while index < count:
+        if (
+            index < count - 1
+            and symbols[index] == left
+            and symbols[index + 1] == right
+        ):
+            out.append(merged)
+            index += 2
+        else:
+            out.append(symbols[index])
+            index += 1
+    return out  
 
 class BPEEncoder:
     """Applies a frozen merge list to individual pieces.
@@ -47,13 +73,13 @@ class BPEEncoder:
         self.vocabulary = vocabulary
         self.merges = list(merges)
 
-        # Rank == position in merges. Lowest rank wins.
-        #
-        # This dict is the entire reason merge *order* is load-bearing: it
-        # converts "the order the trainer discovered these pairs" into an
-        # O(1) priority lookup. Sorting or deduplicating `merges` anywhere
-        # upstream renumbers every rank and silently changes tokenization.
         self.ranks = {pair: rank for rank, pair in enumerate(self.merges)}
+
+        # Real text repeats pieces relentlessly -- "the" arrives thousands of
+        # times and always yields the same ids. Keyed by byte ids, so it stays
+        # valid for this encoder's lifetime: ranks never change.
+        self._cache: dict[tuple[int, ...], tuple[int, ...]] = {}
+
 
     def encode_piece(self, byte_ids: list[int]) -> list[int]:
         """Collapse `byte_ids` into the fewest token ids the merges allow.
@@ -62,23 +88,46 @@ class BPEEncoder:
         encoding have already run -- see Tokenizer.encode. Returns ids again,
         so it is a drop-in replacement for the no-merge passthrough.
 
-        Algorithm to implement:
-          1. Map byte ids to their vocabulary symbols.
-          2. Of all adjacent pairs, find the one with the lowest rank in
-             self.ranks. If no pair is ranked, stop -- this piece is already
-             as merged as the rules allow.
-          3. Merge every occurrence of that pair, scanning left to right.
-             Left to right matters for overlaps: merging ('a','a') in "aaa"
-             gives 'aa' + 'a', not 'a' + 'aa'.
-          4. Repeat from 2 until one symbol remains or no pair is ranked.
-          5. Map the surviving symbols back to ids.
-
-        A single-symbol piece needs no work: there is no adjacent pair, so
-        step 2 stops immediately and the byte id passes through unchanged.
-
-        Never merge across pieces -- the pre-tokenizer's boundaries are the
-        whole reason it runs first.
+        Never merges across pieces -- the pre-tokenizer's boundaries are the
+        whole reason it runs first, and this method only ever sees one piece.
         """
-        raise NotImplementedError(
-            "bpe_encoder.encode_piece needs merges from bpe_trainer"
-        )
+        # No adjacent pair exists, so no merge can apply.
+        if len(byte_ids) < 2:
+            return list(byte_ids)
+
+        key = tuple(byte_ids)
+        if key in self._cache:
+            return list(self._cache[key])
+
+        # Vocabulary.byte_baseline() assigns id == byte value, so the
+        # vocabulary is already the symbol table -- no need for
+        # byte_encoder.bytes_to_unicode() here.
+        symbols = [self.vocabulary.id_to_token[byte_id] for byte_id in byte_ids]
+
+        while len(symbols) > 1:
+            # Lowest rank present, NOT leftmost. Leftmost would apply merges
+            # out of training order -- see the "there" trace above.
+            best_pair, best_rank = None, None
+            for pair in zip(symbols, symbols[1:]):
+                rank = self.ranks.get(pair)
+                if rank is not None and (best_rank is None or rank < best_rank):
+                    best_pair, best_rank = pair, rank
+
+            # No ranked pair left: as merged as the rules allow.
+            if best_pair is None:
+                break
+
+            symbols = merge_pair(symbols, best_pair)
+
+        try:
+            ids = [self.vocabulary.token_to_id[symbol] for symbol in symbols]
+        except KeyError as missing:
+            raise KeyError(
+                f"merge produced token {missing.args[0]!r}, which is not in "
+                f"the vocabulary -- merges.txt and vocab.json are almost "
+                f"certainly from different training runs"
+            ) from None
+
+        self._cache[key] = tuple(ids)
+        return ids
+

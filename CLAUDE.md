@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A BPE tokenizer built from scratch for learning, wrapped in a FastAPI endpoint that
 streams the tokenization step-by-step over SSE so the process is watchable.
-`bpe_trainer.py` and `bpe_encoder.py` are deliberate stubs — the merge-learning
-algorithm is the next thing to build. Everything else works today at the byte level.
+All eight stages are implemented. With no merges the tokenizer is byte-level (256
+tokens); trained, it compresses ~2.4× on corpus-like text and degrades toward bytes
+on unseen text rather than failing.
 
 ## Commands
 
@@ -72,10 +73,20 @@ text ─▶ normalization.normalize ─▶ PreTokenizer.split ─▶ [per piece]
 ```
 
 `Tokenizer.__init__` sets `self._bpe = None` when `merges` is empty, and `encode()` then
-passes byte ids straight through. Once `bpe_trainer.train` returns real merges, that one
-branch wakes up and no other module changes. This is the seam the whole layout exists to
-protect — implement the trainer and encoder against it rather than reshaping the
-pipeline.
+passes byte ids straight through. With merges, `BPEEncoder.encode_piece` runs instead.
+That one branch is the whole BPE integration point — `main.py`, `decoder.py`, and
+`vocabulary.py` are identical either way. Preserve it: anything that needs to know
+whether merges exist belongs behind this branch, not spread through the pipeline.
+
+`merge_pair` is a module-level function in `bpe_encoder.py` that `bpe_trainer.py`
+imports. Trainer and encoder must apply merges byte-identically — the trainer rewrites
+word tuples with it, the encoder rewrites one piece — so the loop exists once. Do not
+inline a second copy.
+
+**Trainer/encoder asymmetry.** `bpe_trainer` counts pair frequencies and *writes* the
+ordered merge list. `bpe_encoder` never counts anything; it *reads* that list and
+applies the lowest-ranked applicable pair. Frequency is decided once, at training time,
+and frozen into list order.
 
 ### Invariants that will bite you
 
@@ -98,6 +109,17 @@ keep using it as the single write path into both dicts.
 **`Vocabulary.byte_baseline()` assigns id == byte value.** That is why
 `byte_encoder.encode()` output is already valid token ids before any merge exists. Merged
 tokens start at 256.
+
+**A vocabulary is only valid under the config it was trained with.** `train()` takes
+`normalization_form` and `pretokenizer`; the `Tokenizer` that uses its output must be
+given the same ones. Neither is written to disk, so `Tokenizer.load()` silently applies
+defaults. A mismatch raises nothing — the encoder just produces pieces the trainer never
+saw, merges stop applying, and token counts balloon. Any test that trains must construct
+the tokenizer with the identical arguments.
+
+**`len(merges)` can be less than `vocab_size - 256`.** Training stops early when no pair
+occurs more than once, because merging a once-seen pair only memorizes noise. Small
+corpora hit this constantly. Code that assumes the full merge budget was spent is wrong.
 
 **`merges` order is the merge ranking.** `BPEEncoder` builds `self.ranks` from list
 position. Never sort or dedupe a merges list — `load_merges` preserves file order for
